@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+
+# Copyright 2015-2020 Odnoklassniki Ltd, Mail.Ru Group
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import urllib
+import urllib.parse
+import urllib.request
+import urllib.error
+import json
+import datetime
+import hashlib
+import logging
+import re
+from collections import OrderedDict
+
+DEFAULT_TIMEOUT = 5
+debuglevel = 0
+
+
+def run():
+    global debuglevel
+    parser = argparse.ArgumentParser(
+        description='docker_rebase allows you to change base image of your Docker image by '
+                    'replacing layers', add_help=False)
+    parser.add_argument('registry_url', help='url of docker registry')
+    parser.add_argument('image', help='name:tag of source image')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('-f', '--force', dest='force', action='store_true',
+                        help='Force overwriting existing target image')
+    parser.add_argument('-e', '--ignore-errors', dest='ignore_errors', action='store_true',
+                        help='Do not fail on unprocessable history commands')
+    parser.add_argument('-b', '--to-base', dest='base_image', help='Target base image name:tag. By default it is '
+                                                                   'autodetected from source image.')
+    parser.add_argument('-t', '--tag', dest='new_tag', help='Target tag for new image. '
+                                                            'By default is the same as of the source.')
+    parser.add_argument('-l', '--label', dest='from_label', help='Name of label containing base image:tag',
+                        default='FROM')
+
+    exclude_group = parser.add_mutually_exclusive_group()
+    exclude_group.add_argument('-L', '--layers', type=int, dest='num_layers',
+                               help='Number of layers of image to keep. By default it is '
+                                    'autodetected from image manifest or from_base.')
+    exclude_group.add_argument('-B', '--from-base', dest='from_base',
+                               help='Current base image name:tag. Used to autodetect num_layers')
+
+    args = parser.parse_args()
+
+    registry = DockerRegistry(args.registry_url)
+    if args.verbose:
+        debuglevel = 1
+        log_level = 'DEBUG'
+    else:
+        log_level = 'INFO'
+    logging.basicConfig(format="%(levelname)s: %(message)s", level=log_level)
+
+    try:
+        registry.image_rebase(args.image, args.new_tag, args.base_image, args.from_base, args.num_layers, args.force,
+                              args.ignore_errors, args.from_label)
+    except RuntimeError as err:
+        logging.error(err)
+        exit(1)
+
+
+class NoHttpErrorHandler(urllib.request.HTTPDefaultErrorHandler):
+    """Do not throw HTTP exceptions, but convert them to status codes
+    """
+
+    def http_error_default(self, req, fp, code, msg, headers):
+        result = urllib.error.HTTPError(req.get_full_url(), code, msg, headers, fp)
+        result.status = code
+        return result
+
+
+class Connection(object):
+    def __init__(self, baseurl, timeout=DEFAULT_TIMEOUT):
+        self.baseurl = baseurl
+        self.urlopener = urllib.request.build_opener(NoHttpErrorHandler(),
+                                                     urllib.request.HTTPSHandler(debuglevel))
+        self.timeout = timeout
+
+    def make_request(self, url, data=None, method=None, headers=None, expect=None):
+        logging.debug(f"Try to request https://{self.baseurl}{url}")
+
+        if headers is None:
+            headers = {}
+
+        if url.startswith('https://') or url.startswith('http://'):
+            target_url = url
+        else:
+            target_url = self.baseurl + url
+
+        if data is not None:
+            if 'Content-Type' not in headers:
+                headers['Content-Type'] = 'application/octet-stream'
+            headers['Content-length'] = len(data)
+
+        request = urllib.request.Request(target_url, data, headers, method=method)
+
+        resp = self.urlopener.open(request, timeout=self.timeout)
+        content = resp.read()
+        resp.close()
+
+        if expect is not None \
+                and resp.getcode() not in expect:
+            raise RuntimeError(
+                'Unexpected response code %s to %s %s' % (resp.getcode(), request.get_method(), target_url))
+
+        return resp, content
+
+
+def is_non_empty_layer(history):
+    return 'empty_layer' not in history or not history['empty_layer']
+
+
+def check_failed(condition, message_supplier, ignore_errors):
+    if condition:
+        return
+    if ignore_errors:
+        logging.warn(message_supplier())
+    else:
+        raise RuntimeError(message_supplier() + ". Use --ignore-errors to suppress this error.")
+
+
+class DockerRegistry(object):
+    def __init__(self, registry_url):
+        if '://' not in registry_url:
+            registry_url = 'http://' + registry_url
+        self.connection = Connection(registry_url)
+
+    def manifest_get(self, name, tag):
+        resp, content = self.connection.make_request(
+            '/v2/' + urllib.parse.quote_plus(name) + '/manifests/' + urllib.parse.quote_plus(tag),
+            headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
+            expect=[200, 404]
+        )
+
+        if resp.getcode() == 404:
+            raise RuntimeError('Image not found %s:%s' % (name, tag))
+
+        return json.loads(content.decode('utf-8'))
+
+    def manifest_upload(self, name, tag, manifest):
+        manifest_url = '/v2/' + urllib.parse.quote_plus(name) + '/manifests/' + urllib.parse.quote_plus(tag)
+        logging.debug(f"Uploading: {self.connection.baseurl + manifest_url}")
+        self.connection.make_request(
+            manifest_url,
+            method='PUT', data=manifest, expect=[201],
+            headers={'Content-Type': 'application/vnd.docker.distribution.manifest.v2+json'}
+        )
+
+    def manifest_exists(self, name, tag):
+        resp, content = self.connection.make_request(
+            '/v2/' + urllib.parse.quote_plus(name) + '/manifests/' + urllib.parse.quote_plus(tag),
+            method='HEAD',
+            expect=[200, 404]
+        )
+        return resp.getcode() == 200
+
+    def blob_get(self, name, digest):
+        resp, content = self.connection.make_request(
+            '/v2/' + urllib.parse.quote_plus(name) + '/blobs/' + urllib.parse.quote_plus(digest),
+            expect=[200, 404]
+        )
+        if resp.getcode() == 404:
+            raise RuntimeError('Blob not found %s:%s' % (name, digest))
+        return json.loads(content.decode('utf-8'))
+
+    def blob_upload(self, name, blob):
+        d = hashlib.sha256()
+        d.update(blob)
+        digest = 'sha256:' + d.digest().hex()
+
+        exists, length = self.blob_exists(name, digest)
+
+        if exists:  # OK already exists
+            logging.info(f"{digest}: Already exists, {length} bytes")
+            return digest
+
+        logging.info(f"{digest}: Uploading {len(blob)} bytes")
+
+        # get upload link
+        resp, content = self.connection.make_request(
+            '/v2/' + urllib.parse.quote_plus(name) + '/blobs/uploads/',
+            method='POST', expect=[202]
+        )
+
+        upload_location = resp.info()['location']
+        resp, content = self.connection.make_request(
+            upload_location + '&digest=' + digest,
+            method='PUT', data=blob, expect=[201]
+        )
+        uploaded_digest = resp.info()['Docker-Content-Digest']
+
+        if digest != uploaded_digest:
+            raise IOError("Uploaded blob digest doesn't match")
+
+        return digest
+
+    def blob_mount(self, name, from_name, digest):
+        exists, length = self.blob_exists(name, digest)
+
+        if exists:  # OK already exists
+            logging.info(f"{digest}: Already exists, {length} bytes")
+            return digest
+
+        logging.info(f"{digest}: Mounting from {from_name}")
+
+        self.connection.make_request(
+            '/v2/' + urllib.parse.quote_plus(name) + '/blobs/uploads/?from=' + urllib.parse.quote_plus(
+                from_name) + '&mount=' + urllib.parse.quote_plus(digest),
+            method='POST', expect=[201]
+        )
+
+    def blob_exists(self, name, digest):
+        blob_url = '/v2/' + urllib.parse.quote_plus(name) + '/blobs/' + digest
+        resp, content = self.connection.make_request(
+            blob_url,
+            method='HEAD', expect=[200, 404]
+        )
+        if resp.getcode() == 404:
+            return False, 0
+        length = resp.info()['Content-Length']
+        registry_digest = resp.info()['Docker-Content-Digest']
+        if digest != registry_digest:
+            raise IOError("Blob digest doesn't match")
+        return True, length
+
+    def image_get(self, name, tag):
+        logging.info(f"Loading manifest {name}:{tag}")
+        image_man = self.manifest_get(name, tag)
+
+        logging.debug(f"Manifest {name}:{tag}:\n{json.dumps(image_man, indent=4)}")
+        image_digest = image_man['config']['digest']
+
+        logging.info(f"Loading configuration {image_digest} for {name}:{tag}")
+        image_blob = self.blob_get(name, image_digest)
+
+        logging.debug(f"Configuration {name}:{tag}:\n{json.dumps(image_blob, indent=4)}")
+
+        return image_man, image_blob, image_digest
+
+    def image_rebase(self, image, new_tag, base_image, old_base_image, num_layers, force, ignore_errors, from_label):
+        name, tag = parse_image_name(image)
+        new_tag = new_tag or tag
+
+        logging.debug(f"Registry: {self.connection.baseurl}")
+
+        image_man, image_blob, image_digest = self.image_get(name, tag)
+
+        if old_base_image is not None:
+            logging.debug(f"Autodetecting num_layers from old base image {old_base_image}")
+
+            old_base_name, old_base_tag = parse_image_name(old_base_image)
+            old_base_man, old_base_blob, __ = self.image_get(old_base_name, old_base_tag)
+
+            if not self.is_base_image(image_man, image_blob, old_base_man, old_base_blob):
+                raise RuntimeError(f"{old_base_image} is not a base image for {image}")
+
+            num_layers = len(image_blob['history']) - len(old_base_blob['history'])
+            logging.debug(f"Container layers: {num_layers}")
+
+        if base_image is None:
+            if from_label not in image_blob['config']['Labels']:
+                raise RuntimeError(f"Cannot autodetect base image: label {from_label} must be set in {image}")
+            base_image = image_blob['config']['Labels'][from_label]
+            logging.info(f"Autodetected base image name: {base_image}")
+
+        if num_layers is None:
+            logging.debug(f"Autodetecting num_layers and base_image by searching for 'LABEL {from_label}' in {image}")
+            try:
+                num_layers = next(index for (index, history) in enumerate(reversed(image_blob['history']))
+                                  if history['created_by'].startswith(f'/bin/sh -c #(nop)  LABEL {from_label}='))
+            except StopIteration:
+                raise RuntimeError(f"Cannot autodetect num_layers: label {from_label} must be set in {image}")
+            num_layers += 1
+            logging.debug(f"Container layers: {num_layers}")
+
+        base_name, base_tag = parse_image_name(base_image)
+        base_man, base_blob, new_base_digest = self.image_get(base_name, base_tag)
+
+        if tag == new_tag:
+            if self.is_base_image(image_man, image_blob, base_man, base_blob):
+                logging.info(f"{image} is already based on {base_image}@{new_base_digest}. Nothing to do.")
+                return
+
+        elif self.manifest_exists(name, new_tag):
+            target_image_man, target_image_blob, __ = self.image_get(name, new_tag)
+            if force:
+                logging.warning(f"Overwriting existing image {name}:{new_tag}.")
+            elif not self.is_same_or_rebased_image(target_image_man, target_image_blob,
+                                                   image_man, image_blob, num_layers):
+                raise RuntimeError(f"Target image {name}:{new_tag} exists and has different top layers. "
+                                   f"Use --force to overwrite.")
+            elif self.is_base_image(target_image_man, target_image_blob, base_man, base_blob):
+                logging.info(f"{name}:{new_tag} is already based on {base_image}@{new_base_digest}. Nothing to do")
+                return
+
+        logging.info(f"Rebasing {name}:{tag}@{image_digest} to {base_image}:{base_tag}@{new_base_digest}")
+
+        base_blob['history'], top_history = merge_lists(image_blob['history'], num_layers, base_blob['history'],
+                                                        'history')
+        nonempty_layers = self.history_apply(base_blob, image_blob, top_history, ignore_errors)
+
+        base_blob['rootfs']['diff_ids'], _ = merge_lists(image_blob['rootfs']['diff_ids'],
+                                                         nonempty_layers,
+                                                         base_blob['rootfs']['diff_ids'], 'rootfs/diff_ids')
+        cc = base_blob['container_config']
+        base_blob['container_config'] = OrderedDict(base_blob['config'])
+        base_blob['container_config']['Cmd'] = cc['Cmd']
+
+        base_blob['config']['Image'] = new_base_digest
+        base_blob['container_config']['Image'] = new_base_digest
+        base_blob['created'] = datetime.datetime.now().isoformat() + 'Z'
+
+        logging.debug(f"New container configuration:\n {json.dumps(base_blob, indent=4)}")
+
+        new_blob = json.dumps(base_blob).encode('utf-8')
+
+        logging.info("Uploading new manifest")
+
+        # mount all layers from new base
+        for layer in base_man['layers']:
+            self.blob_mount(name, base_name, layer['digest'])
+
+        new_digest = self.blob_upload(name, new_blob)
+
+        base_man['layers'], _ = merge_lists(image_man['layers'], nonempty_layers, base_man['layers'], 'layers')
+        base_man['config']['size'] = len(new_blob)
+        base_man['config']['digest'] = new_digest
+
+        logging.debug(f"New image manifest:\n {json.dumps(base_man, indent=4)}")
+        new_man = json.dumps(base_man).encode('utf-8')
+
+        self.manifest_upload(name, new_tag, new_man)
+        logging.info(f"Created {name}:{new_tag}@{new_digest}")
+
+    @staticmethod
+    def history_apply(new_container, old_container, container_history, ignore_errors):
+        nonempty_layers = 0
+        # copy all meta parameters and count non-empty layers
+        for history in container_history:
+            empty_layer = is_non_empty_layer(history)
+            if empty_layer:
+                nonempty_layers += 1
+            elif history['created_by'].startswith('/bin/sh -c #(nop)'):
+                cmd = history['created_by'][len('/bin/sh -c #(nop)'):].lstrip()
+                logging.debug(f"Applying {cmd}")
+
+                cmd_name, cmd_rest = cmd.split(' ', 1)
+                if cmd_name == 'CMD':
+                    new_container['config']['Cmd'] = old_container['config']['Cmd']
+
+                elif cmd_name == 'ENTRYPOINT':
+                    new_container['config']['Entrypoint'] = old_container['config']['Entrypoint']
+
+                elif cmd_name == 'USER':
+                    new_container['config']['User'] = old_container['config']['User']
+
+                elif cmd_name == 'WORKDIR':
+                    new_container['config']['WorkingDir'] = old_container['config']['WorkingDir']
+
+                elif cmd_name == 'LABEL':
+                    # E.g.: LABEL key1=val1 key2=val2 key3=val with spaces
+                    for key_match in re.finditer(r"([^ ]+)=", cmd_rest):
+                        label = key_match.group(1)
+                        if check_failed(label in old_container['config']['Labels'], lambda: f"No {label} Label found.",
+                                        ignore_errors):
+                            continue
+                        val = old_container['config']['Labels'][label]
+                        if 'Labels' not in new_container['config']:
+                            new_container['config']['Labels'] = OrderedDict()
+                        new_container['config']['Labels'][label] = val
+
+                elif cmd_name == 'ENV':
+                    # E.g.: ENV key1=val1 key2=val2 key3=val with spaces
+                    env_names = [key_match.group(1) for key_match in re.finditer(r"([^ ]+)=", cmd_rest)]
+                    if len(env_names) == 0:
+                        # E.g.: ENV key value
+                        env_names = [cmd_rest.split(' ', 1)[0]]
+                    for env_name in env_names:
+                        new_envs = old_container['config']['Env']
+                        new_val = [x for x in new_envs if x.startswith(env_name + '=')]
+                        if check_failed(len(new_val) > 0, lambda: f"No {env_name} ENV found.", ignore_errors):
+                            continue
+                        old_envs = new_container['config']['Env']
+                        old_val = [x for x in old_envs if x.startswith(env_name + '=')]
+                        if len(old_val) == 0:
+                            new_container['config']['Env'] = old_envs + new_val
+                        else:
+                            new_container['config']['Env'] = [new_val[0] if x.startswith(env_name + '=') else x for x in
+                                                              old_envs]
+
+                elif cmd_name == 'EXPOSE':
+                    # E.g.: EXPOSE port1 port2/tcp port3/udp
+                    ports = cmd_rest.split(' ')
+                    for port in ports:
+                        port = port if '/' in port else port + '/tcp'
+                        if check_failed(port in old_container['config']['ExposedPorts'],
+                                        lambda: f"No {port} found in ExposedPorts config of image.", ignore_errors):
+                            continue
+                        val = old_container['config']['ExposedPorts'][port]
+                        if 'ExposedPorts' not in new_container['config'] or new_container['config'][
+                            'ExposedPorts'] is None:
+                            new_container['config']['ExposedPorts'] = OrderedDict()
+                        new_container['config']['ExposedPorts'][port] = val
+
+                elif cmd_name == 'VOLUME':
+                    # E.g.: VOLUME [/data /mnt/db]
+                    if check_failed(cmd_rest.startswith('[') and cmd_rest.endswith(']'),
+                                    lambda: f"Unrecognized VOLUME command args: {cmd_rest}",
+                                    ignore_errors):
+                        continue
+
+                    for path in cmd_rest[1: len(cmd_rest) - 1].split(' '):
+                        if check_failed(path in old_container['config']['Volumes'],
+                                        lambda: f"No {path} found in Volumes config of image.", ignore_errors):
+                            continue
+                        if 'Volumes' not in new_container['config'] or new_container['config']['Volumes'] is None:
+                            new_container['config']['Volumes'] = OrderedDict()
+                        if not path in new_container['config']['Volumes']:
+                            new_container['config']['Volumes'][path] = old_container['config']['Volumes'][path]
+
+                else:
+                    if check_failed(False, lambda: f"Unsupported history command: {cmd}",
+                                    ignore_errors):
+                        continue
+
+        return nonempty_layers
+
+    def is_base_image(self, image_man, image_blob, base_man, base_blob):
+        return self.is_base(image_man['layers'], base_man['layers']) \
+               and self.is_base(image_blob['history'], base_blob['history'])
+
+    @staticmethod
+    def is_base(image_list, base_list):
+        return image_list[:len(base_list)] == base_list
+
+    @staticmethod
+    def is_same_or_rebased_image(man1, blob1, man2, blob2, num_layers):
+        last_history = blob1['history'][-num_layers:]
+        if last_history != blob2['history'][-num_layers:]:
+            return False
+        nonempty_layers = len([x for x in last_history if is_non_empty_layer(x)])
+        return man1['layers'][-nonempty_layers:] == man2['layers'][-nonempty_layers:]
+
+
+def parse_image_name(image):
+    splits = image.split('@', 1)
+    if len(splits) > 1:
+        return splits[0], splits[1]
+    splits = image.split(':', 1)
+    return splits[0], (splits[1] if len(splits) > 1 else 'latest')
+
+
+def merge_lists(orig_list, num_elements, new_base, descr):
+    if len(orig_list) < num_elements:
+        raise IOError(f"Base manifest check failed. {descr} has invalid length: {len(orig_list)} < {num_elements}")
+
+    top_list = orig_list[len(orig_list) - num_elements:]
+    return new_base + top_list, top_list
+
+
+if __name__ == '__main__':
+    run()
