@@ -19,6 +19,7 @@ import urllib
 import urllib.parse
 import urllib.request
 import urllib.error
+import ssl
 import json
 import datetime
 import hashlib
@@ -48,6 +49,8 @@ def run():
                                                             'By default is the same as of the source.')
     parser.add_argument('-l', '--label', dest='from_label', help='Name of label containing base image:tag',
                         default='FROM')
+    parser.add_argument('-T', '--timeout', dest='timeout', type=int, default=DEFAULT_TIMEOUT, help='Connection timeout in ms.')
+    parser.add_argument('--ssl-ca', dest='ssl_ca', help='Path to ssl CA certificate.')
 
     exclude_group = parser.add_mutually_exclusive_group()
     exclude_group.add_argument('-L', '--layers', type=int, dest='num_layers',
@@ -58,7 +61,8 @@ def run():
 
     args = parser.parse_args()
 
-    registry = DockerRegistry(args.registry_url)
+    ssl_context = create_ssl_context(args)
+    registry = DockerRegistry(args.registry_url, ssl_context)
     if args.verbose:
         debuglevel = 1
         log_level = 'DEBUG'
@@ -84,11 +88,17 @@ class NoHttpErrorHandler(urllib.request.HTTPDefaultErrorHandler):
         return result
 
 
+def create_ssl_context(args):
+    sslctx = ssl.SSLContext()
+    if args.ssl_ca:
+        sslctx.load_verify_locations(args.ssl_ca)
+    return sslctx
+
 class Connection(object):
-    def __init__(self, baseurl, timeout=DEFAULT_TIMEOUT):
+    def __init__(self, baseurl, ssl_context=None, timeout=DEFAULT_TIMEOUT):
         self.baseurl = baseurl
         self.urlopener = urllib.request.build_opener(NoHttpErrorHandler(),
-                                                     urllib.request.HTTPSHandler(debuglevel))
+                                                     urllib.request.HTTPSHandler(debuglevel, context=ssl_context))
         self.timeout = timeout
 
     def make_request(self, url, data=None, method=None, headers=None, expect=None):
@@ -135,10 +145,10 @@ def check_failed(condition, message_supplier, ignore_errors):
 
 
 class DockerRegistry(object):
-    def __init__(self, registry_url):
+    def __init__(self, registry_url, ssl_context=None, timeout=DEFAULT_TIMEOUT):
         if '://' not in registry_url:
             registry_url = 'http://' + registry_url
-        self.connection = Connection(registry_url)
+        self.connection = Connection(registry_url, ssl_context=ssl_context, timeout=timeout)
 
     def manifest_get(self, name, tag):
         resp, content = self.connection.make_request(
