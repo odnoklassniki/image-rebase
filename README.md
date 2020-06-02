@@ -64,19 +64,7 @@ You can retrieve history using `docker inspect <image>` and count numbers of com
 ### Limitations
 
 * Docker Registry authentication is not supported
-* Support for Dockerfile commands is limited for images being rebased. However, these limitations do not apply to base images - only to images that are derived from them.
-List of currently supported commands:
-    * CMD
-    * ENTRYPOINT
-    * ADD
-    * COPY
-    * USER
-    * WORKDIR
-    * RUN commands are not re-executed by design. Their result is reused from old image. 
-    Be careful using commands whose result depends on the base image.
-    * EXPOSE
-    * ENV
-    * LABEL
+* RUN commands are not re-executed by design. Resulting layer is reused from old image. Be careful using commands whose result depends on the base image.
 
 Prerequisites
 -----------
