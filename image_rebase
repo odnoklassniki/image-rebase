@@ -318,7 +318,7 @@ class DockerRegistry(object):
                 logging.info(f"{name}:{new_tag} is already based on {base_image}@{new_base_digest}. Nothing to do")
                 return
 
-        logging.info(f"Rebasing {name}:{tag}@{image_digest} to {base_image}:{base_tag}@{new_base_digest}")
+        logging.info(f"Rebasing {name}:{tag}@{image_digest} to {base_image}@{new_base_digest}")
 
         base_blob['history'], top_history = merge_lists(image_blob['history'], num_layers, base_blob['history'],
                                                         'history')
